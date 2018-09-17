@@ -6,7 +6,7 @@ python main.py
 # CUDA_VISIBLE_DEVICES=2 python main.py  # to specify GPU id to ex. 2
 ```
 
-## Running FP-16 Mixed Precision Training
+## Running FP-16 Mixed Precision Training for MNIST
 
 ```
 python main.py --fp16 1 
