@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torchvision import datasets, transforms
+from fp16util import network_to_half, set_grad, copy_in_params
 
 class Net(nn.Module):
     def __init__(self):
@@ -31,7 +32,22 @@ def train(args, model, device, train_loader, optimizer, epoch):
         optimizer.zero_grad()
         output = model(data)
         loss = F.nll_loss(output, target)
+
+        ## Note: scaling the loss for mixed precision training.
+        loss = loss * args.scale_factor
+        model.zero_grad()
+
         loss.backward()
+        set_grad(param_copy, list(model.parameters()))
+
+        if args.scale_factor != 1:
+            for param in param_copy:
+                param.grad.data = param.grad.data / args.scale_factor
+        optimizer.step()
+        params = list(model.parameters())
+        for i in range(len(params)):
+            params[i].data.copy_(param_copy[i].data)
+
         optimizer.step()
         if batch_idx % args.log_interval == 0:
             print('Train Epoch: {} [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
@@ -74,12 +90,20 @@ def main():
                         help='random seed (default: 1)')
     parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                         help='how many batches to wait before logging training status')
+    parser.add_argument('--fp16', type=int, default=0, required=False,
+                        help='undergo fp16 training')
+    parser.add_argument('--scale_factor', type=float, default=1,
+                        help='Loss scale factor for fp16 training')
+
     args = parser.parse_args()
     use_cuda = not args.no_cuda and torch.cuda.is_available()
 
     torch.manual_seed(args.seed)
 
     device = torch.device("cuda" if use_cuda else "cpu")
+
+    if args.fp16:
+        assert torch.backends.cudnn.enabled
 
     kwargs = {'num_workers': 1, 'pin_memory': True} if use_cuda else {}
     train_loader = torch.utils.data.DataLoader(
@@ -98,12 +122,25 @@ def main():
 
 
     model = Net().to(device)
-    optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.momentum)
+    if args.fp16:
+        print ("INFO: training the network for fp16")
+        model = network_to_half(model)
+    
+    global param_copy
+    if args.fp16:
+        param_copy = [param.clone().type(torch.cuda.FloatTensor).detach() for param in model.parameters()]
+        for param in param_copy:
+            param.requires_grad = True
+    else:
+        param_copy = list(model.parameters())
+    
+    optimizer = optim.SGD(param_copy, lr=args.lr, momentum=args.momentum)
+
+    print (model)
 
     for epoch in range(1, args.epochs + 1):
         train(args, model, device, train_loader, optimizer, epoch)
         test(args, model, device, test_loader)
-
 
 if __name__ == '__main__':
     main()
