@@ -16,6 +16,7 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
+from fp16util import network_to_half, set_grad, copy_in_params 
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -61,6 +62,10 @@ parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
+parser.add_argument('--fp16', required=False, type=int,
+                    help='FP16 training [0|1]')
+parser.add_argument('--loss-scale', type=float, default=1,
+                    help='loss scaling to improve fp16 convergence')
 
 best_prec1 = 0
 
@@ -89,6 +94,9 @@ def main():
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size)
 
+    if args.fp16:
+        assert torch.backends.cudnn.enabled
+
     # create model
     if args.pretrained:
         print("=> using pre-trained model '{}'".format(args.arch))
@@ -109,10 +117,21 @@ def main():
         else:
             model = torch.nn.DataParallel(model).cuda()
 
+    if args.fp16:
+        model = network_to_half(model)
+    
+    global param_copy
+    if args.fp16:
+        param_copy = [param.clone().type(torch.cuda.FloatTensor).detach() for param in model.parameters()]
+        for param in param_copy:
+            param.requires_grad = True
+    else:
+        param_copy = list(model.parameters())
+
     # define loss function (criterion) and optimizer
     criterion = nn.CrossEntropyLoss().cuda(args.gpu)
 
-    optimizer = torch.optim.SGD(model.parameters(), args.lr,
+    optimizer = torch.optim.SGD(param_copy, args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay)
 
@@ -193,6 +212,12 @@ def main():
         }, is_best)
 
 
+def to_python_float(t):
+    if hasattr(t, 'item'):
+        return t.item()
+    else:
+        return t[0]
+
 def train(train_loader, model, criterion, optimizer, epoch):
     batch_time = AverageMeter()
     data_time = AverageMeter()
@@ -218,14 +243,37 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         # measure accuracy and record loss
         prec1, prec5 = accuracy(output, target, topk=(1, 5))
-        losses.update(loss.item(), input.size(0))
-        top1.update(prec1[0], input.size(0))
-        top5.update(prec5[0], input.size(0))
+
+        if args.distributed:
+            reduced_loss = reduce_tensor(loss.data)
+            prec1 = reduce_tensor(prec1)
+            prec5 = reduce_tensor(prec5)
+        else:
+            reduced_loss = loss.data
+
+        losses.update(to_python_float(reduced_loss), input.size(0))
+        top1.update(to_python_float(prec1), input.size(0))
+        top5.update(to_python_float(prec5), input.size(0))
+
+        loss = loss * args.loss_scale
 
         # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+        if args.fp16:
+            model.zero_grad()
+            loss.backward()
+            set_grad(param_copy, list(model.parameters()))
+
+            if args.loss_scale != 1:
+                for param in param_copy:
+                    param.grad.data = param.grad.data/args.loss_scale
+
+            optimizer.step()
+            copy_in_params(model, param_copy)
+            torch.cuda.synchronize()
+        else:
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -240,7 +288,6 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Prec@5 {top5.val:.3f} ({top5.avg:.3f})'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses, top1=top1, top5=top5))
-
 
 def validate(val_loader, model, criterion):
     batch_time = AverageMeter()
@@ -262,11 +309,17 @@ def validate(val_loader, model, criterion):
             output = model(input)
             loss = criterion(output, target)
 
+            reduce_loss = reduce_tensor(loss.data)
+
             # measure accuracy and record loss
-            prec1, prec5 = accuracy(output, target, topk=(1, 5))
-            losses.update(loss.item(), input.size(0))
-            top1.update(prec1[0], input.size(0))
-            top5.update(prec5[0], input.size(0))
+            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
+
+            reduced_prec1 = reduce_tensor(prec1)
+            reduced_prec5 = reduce_tensor(prec5)
+
+            losses.update(to_python_float(reduced_loss), input.size(0))
+            top1.update(to_python_float(prec1), input.size(0))
+            top5.update(to_python_float(prec5), input.size(0))
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -286,12 +339,10 @@ def validate(val_loader, model, criterion):
 
     return top1.avg
 
-
 def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     torch.save(state, filename)
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
-
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
@@ -334,6 +385,11 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
+def reduced_tensor(tensor):
+    rt = tensor.clone()
+    dist.all_reduce(rt, op=dist.reduce_op.SUM)
+    rt /= args.world_size
+    return rt
 
 if __name__ == '__main__':
     main()
