@@ -176,7 +176,7 @@ def main():
         adjust_learning_rate(optimizer, epoch)
 
         # train for one epoch
-        train(train_loader, model, criterion, optimizer, epoch)
+        train(train_loader, model, criterion, optimizer, epoch, args.batch_size)
 
         # evaluate on validation set
         validate(val_loader, model, criterion)
@@ -194,7 +194,7 @@ def main():
         }, is_best)
         '''
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch, total_batch_size):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -229,8 +229,11 @@ def train(train_loader, model, criterion, optimizer, epoch):
         optimizer.step()
 
         # measure elapsed time
-        batch_time.update(time.time() - end)
+        dt = time.time() - end
+        batch_time.update(dt)
         end = time.time()
+        images_sec = total_batch_size/dt
+        
 
         if i % args.print_freq == 0:
             '''
@@ -249,6 +252,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
                   'Loss {loss.val:.4f} ({loss.avg:.4f})\t'.format(
                    epoch, i, len(train_loader), batch_time=batch_time,
                    data_time=data_time, loss=losses))
+            print('Images/sec : ' + str(images_sec))
 
 
 

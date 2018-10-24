@@ -21,8 +21,10 @@ def set_grad(params, params_with_grad):
         param.grad.data.copy_(param_w_grad.grad.data)
 
 def BN_convert_float(module):
+    '''
     if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
         module.float()
+    '''
     for child in module.children():
         BN_convert_float(child)
     return module

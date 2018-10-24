@@ -89,7 +89,7 @@ def main():
                       'disable data parallelism.')
 
     args.distributed = args.world_size > 1
-
+    print ("INFO: args.distributed values is : {} and value of worldsize is {}".format(args.distributed, args.world_size))
     if args.distributed:
         dist.init_process_group(backend=args.dist_backend, init_method=args.dist_url,
                                 world_size=args.world_size)
@@ -309,13 +309,15 @@ def validate(val_loader, model, criterion):
             output = model(input)
             loss = criterion(output, target)
 
-            reduce_loss = reduce_tensor(loss.data)
+            #measure accuracy and record loss.
+            prec1, prec5 = accuracy(output.data, target, topk=(1,5))
 
-            # measure accuracy and record loss
-            prec1, prec5 = accuracy(output.data, target, topk=(1, 5))
-
-            reduced_prec1 = reduce_tensor(prec1)
-            reduced_prec5 = reduce_tensor(prec5)
+            if args.distributed:
+                reduced_loss = reduce_tensor(loss.data)
+                prec1 = reduce_tensor(prec1)
+                prec5 = reduce_tensor(prec5)
+            else:
+                reduced_loss = loss.data
 
             losses.update(to_python_float(reduced_loss), input.size(0))
             top1.update(to_python_float(prec1), input.size(0))
@@ -385,7 +387,7 @@ def accuracy(output, target, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
-def reduced_tensor(tensor):
+def reduce_tensor(tensor):
     rt = tensor.clone()
     dist.all_reduce(rt, op=dist.reduce_op.SUM)
     rt /= args.world_size
