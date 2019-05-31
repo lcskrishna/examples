@@ -1,5 +1,8 @@
-import torch
+mport torch
 import torch.nn as nn
+import os
+
+enable_miopen = (os.getenv("DISABLE_MIOPEN") == None)
 
 class tofp16(nn.Module):
     def __init__(self):
@@ -20,15 +23,19 @@ def set_grad(params, params_with_grad):
             param.grad = torch.nn.Parameter(param.data.new().resize_(*param.data.size()))
         param.grad.data.copy_(param_w_grad.grad.data)
 
+def get_param_copy(net):
+    param_copy = [param.clone().type(torch.cuda.FloatTensor).detach() for param in net.parameters()]
+    for param in param_copy:
+        param.requires_grad=True
+    return param_copy
+
 def BN_convert_float(module):
-    '''
-    if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
-        module.float()
-    '''
+    if (enable_miopen):
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            module.float()
     for child in module.children():
         BN_convert_float(child)
     return module
 
 def network_to_half(network):
     return nn.Sequential(tofp16(), BN_convert_float(network.half()))
-
